@@ -47,7 +47,10 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree, optimizer_type="default", scale_min=None, scale_max=None):
+    def __init__(self, sh_degree, optimizer_type="default", use_uniform=False):
+        #add new
+        self.use_uniform = use_uniform
+        #Original
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree  
@@ -63,11 +66,6 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        self.layer_ids = torch.zeros(0, dtype=torch.int, device="cuda")  # Initialize an empty tensor for layer_ids
-
-        self.scale_min = scale_min
-        self.scale_max = scale_max
-
         self.setup_functions()
 
     def capture(self):
@@ -102,9 +100,7 @@ class GaussianModel:
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        if opt_dict is not None and self.optimizer is not None:
-            self.optimizer.load_state_dict(opt_dict)
-        #self.optimizer.load_state_dict(opt_dict)
+        self.optimizer.load_state_dict(opt_dict)
 
     @property
     def get_scaling(self):
@@ -145,9 +141,15 @@ class GaussianModel:
             return self._exposure[self.exposure_mapping[image_name]]
         else:
             return self.pretrained_exposures[image_name]
-    
-    def get_covariance(self, scaling_modifier = 1):
-        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+    #Change Gaussian to Uniform
+    def get_covariance(self, scaling_modifier=1):
+    # Return isotropic constant matrix, e.g., identity scaled
+        if self.use_uniform:
+            B = self.get_xyz.shape[0]
+            return torch.eye(3, device="cuda")[None, :, :].repeat(B, 1, 1) * 0.1
+        else:
+            return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -155,20 +157,51 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd : BasicPointCloud, cam_infos : int, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        
+        #for Uniform
+        keep = 10000
+        points = np.asarray(pcd.points)[:keep]
+        colors = np.asarray(pcd.colors)[:keep]
+        #fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        # fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+
+        fused_point_cloud = torch.tensor(points).float().cuda()
+        fused_color=RGB2SH(torch.tensor(colors).float().cuda())
+
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
 
+
+        N=points.shape[0]
+
+
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+
+
+  
+
+        #dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(points)).float().cuda()), 0.0000001)
+        ##Initialization Gaussian (Original)
+        # scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        # rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        # rots[:, 0] = 1
+
+        #Change Gaussian to Uniform    
+        # scales = torch.zeros((N, 3), device="cuda")  # 或直接常数，如 0.01
+        # rots = torch.zeros((N, 4), device="cuda")
+        # rots[:, 0] = 1  # 单位四元数，表示无旋转
+
+        scales = torch.full((fused_point_cloud.shape[0], 3), 0.01, device="cuda")
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
+        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), device="cuda"))
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+
+        #opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -177,18 +210,6 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-
-        # # 分层初始化
-        # gaussians = self._scaling  # 获取当前高斯球的尺度数据（scales）
-        # assign_layer_threshold(gaussians, tau1=0.08, tau2=0.03)  # 使用阈值进行分层
-        # print_layer_stats(gaussians)  # 输出每层的统计信息
-
-        # # Here we assume that each Gaussian has a `layer_id`, and we assign it based on the threshold
-        # self.layer_ids = torch.zeros(self._scaling.shape[0], device="cuda", dtype=torch.int)  # Placeholder for layer_ids
-        # for idx in range(self._scaling.shape[0]):
-        #     self.layer_ids[idx] = gaussians[idx].layer_id  # Assign the `layer_id` based on `scales`
-
-
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
@@ -203,10 +224,23 @@ class GaussianModel:
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"}
+            #,
+            #Change Gaussian to Uniform
+            # {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+            # {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
+
+        # if not self.use_uniform:
+        #     l.extend([
+        #         {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+        #         {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+        #     ]
+
+        #     )
+
+        self._scaling.requires_grad=False
+        self._rotation.requires_grad=False
 
         if self.optimizer_type == "default":
             self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -228,8 +262,6 @@ class GaussianModel:
                                                         lr_delay_steps=training_args.exposure_lr_delay_steps,
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
-        for param in [self._features_dc, self._features_rest, self._opacity, self._xyz, self._scaling, self._rotation]:
-            print(f"{param.shape} requires_grad={param.requires_grad}, is_leaf={param.is_leaf}")
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -334,12 +366,6 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
 
-        self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
-        self.tmp_radii = torch.zeros((self._xyz.shape[0]), device="cuda")  # ✅ 补上这行
-
-        self.pretrained_exposures = None
-
-
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -381,8 +407,9 @@ class GaussianModel:
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
+        if not self.use_uniform:
+            self._scaling = optimizable_tensors["scaling"]
+            self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -425,8 +452,9 @@ class GaussianModel:
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
+        ##Uniform
+        # self._scaling = optimizable_tensors["scaling"]
+        # self._rotation = optimizable_tensors["rotation"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -434,20 +462,6 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
-
-        # num_points = self._xyz.shape[0]
-        # if grads.shape[0] > num_points:
-        #     print(f"[WARNING] grads has more entries ({grads.shape[0]}) than current Gaussians ({num_points}), cropping grads.")
-        #     grads = grads[:num_points]
-        # elif grads.shape[0] < num_points:
-        #     pad = num_points - grads.shape[0]
-        #     grads = torch.cat([grads, torch.zeros(pad, 1, device=grads.device)], dim=0)
-
-        #     if grads.shape[0] != self._xyz.shape[0]:
-        #         pad = self._xyz.shape[0] - grads.shape[0]
-        #         grads = torch.cat([grads, torch.zeros(pad, 1, device=grads.device)], dim=0)
-
-
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -473,7 +487,6 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-        
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
@@ -513,154 +526,3 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
-
-    
-    def filter_gaussians_by_layer(self, render_layers=[1, 2, 3]):
-        """
-        Filters Gaussians by layer_id.
-        :param render_layers: List of layer IDs to render
-        :return: filtered list of Gaussians based on layer_id
-        """
-        filtered_gaussians = []
-        
-        # Assuming each Gaussian object has a `layer_id` attribute.
-        for idx in range(self._scaling.shape[0]):
-            # Access the layer_id directly from the Gaussian object, 
-            # not from the scaling property.
-            layer_id = self.gaussians[idx].layer_id  # This assumes each Gaussian has a `layer_id` attribute
-            
-            if layer_id in render_layers:
-                filtered_gaussians.append(self.gaussians[idx])  # Or append the corresponding Gaussian object
-        
-        return filtered_gaussians
-    
-    def assign_layer_ids(self, scales):
-        """
-        根据每个高斯球的尺度（scaling）来分配 `layer_id`。
-        这里我们使用最大尺度（即 3D 各个轴的最大值）来确定层级。
-        """
-        layer_ids = torch.zeros(scales.shape[0], dtype=torch.int, device="cuda")
-
-        for idx in range(scales.shape[0]):
-            # 使用 scales[idx] 的最大值来决定该高斯球的层级
-            scale_value = torch.max(scales[idx]).item()  # 获取最大尺度值，作为单一的标量值
-
-            # 根据尺度值分配层级
-            if scale_value > 0.1:  # 粗层
-                layer_ids[idx] = 1
-            elif scale_value > 0.03:  # 中层
-                layer_ids[idx] = 2
-            else:  # 细节层
-                layer_ids[idx] = 3
-
-        return layer_ids
-    def select_coarse_gaussians(self, scale_threshold=0.1):
-        """
-        筛选 Coarse 层的高斯球（根据 scale 大小筛选）
-        Args:
-            scale_threshold (float): 尺度阈值（大于此值的高斯球属于 Coarse 层）
-        Returns:
-            torch.Tensor: Coarse 层的高斯球索引
-        """
-        scales = self.get_scaling  # 获取所有高斯球的尺度
-        max_scales = torch.max(scales, dim=1).values
-        coarse_indices = (max_scales > scale_threshold).nonzero(as_tuple=True)[0]
-
-        print(f"Number of Coarse Gaussians: {len(coarse_indices)}")
-        return coarse_indices
-
-    def limit_scale_range(self, min_scale=None, max_scale=None):
-        """
-        将当前高斯球的 Scale 限制在指定范围内
-        Args:
-            min_scale (float): 最小 Scale 值（若为 None，则使用初始化值）
-            max_scale (float): 最大 Scale 值（若为 None，则使用初始化值）
-        """
-        min_scale = min_scale if min_scale is not None else self.scale_min
-        max_scale = max_scale if max_scale is not None else self.scale_max
-
-        with torch.no_grad():
-            current_scales = self.get_scaling
-            limited_scales = torch.clamp(current_scales, min=min_scale, max=max_scale)
-            self._scaling.data = torch.log(limited_scales)
-
-            # print(f"Scale limited to range: [{min_scale}, {max_scale}]")
-
-    def clone_gaussians_by_index(self, indices, new_scale_value=None):
-        with torch.no_grad():
-            new_xyz = self._xyz[indices].clone()
-            new_features_dc = self._features_dc[indices].clone()
-            new_features_rest = self._features_rest[indices].clone()
-            new_opacity = self._opacity[indices].clone()
-            new_scaling = self._scaling[indices].clone()
-            if new_scale_value is not None:
-                new_scaling[:] = torch.log(torch.full_like(new_scaling, new_scale_value))
-            new_rotation = self._rotation[indices].clone()
-            new_tmp_radii = self.max_radii2D[indices].clone()
-
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
-        # Inside class GaussianModel
-    def append_gaussians(self, pos, shs, scale, rot, opacity):
-        self._xyz = torch.cat([self._xyz, pos.detach().clone()], dim=0)
-
-        ch_dc = self._features_dc.shape[1]
-        sh_dc = shs[:, :ch_dc]
-        sh_rest = shs[:, ch_dc:]
-
-        self._features_dc = torch.cat([self._features_dc, sh_dc.detach().clone()], dim=0)
-        self._features_rest = torch.cat([self._features_rest, sh_rest.detach().clone()], dim=0)
-        self._scaling = torch.cat([self._scaling, scale.detach().clone()], dim=0)
-        self._rotation = torch.cat([self._rotation, rot.detach().clone()], dim=0)
-        self._opacity = torch.cat([self._opacity, opacity.detach().clone()], dim=0)
-
-        # ✅ 关键补丁：同步扩展 max_radii2D
-        if hasattr(self, 'max_radii2D'):
-            new_radii = torch.zeros(pos.shape[0], device=self.max_radii2D.device)
-            self.max_radii2D = torch.cat([self.max_radii2D, new_radii], dim=0)
-        # Densification buffers must also be expanded
-        if hasattr(self, "xyz_gradient_accum"):
-            new_accum = torch.zeros((pos.shape[0], 1), device=self.xyz_gradient_accum.device)
-            self.xyz_gradient_accum = torch.cat([self.xyz_gradient_accum, new_accum], dim=0)
-
-        if hasattr(self, "denom"):
-            new_denom = torch.zeros((pos.shape[0], 1), device=self.denom.device)
-            self.denom = torch.cat([self.denom, new_denom], dim=0)
-
-        if hasattr(self, 'tmp_radii'):
-            new_tmp_radii = torch.zeros(pos.shape[0], device=self.tmp_radii.device)
-            self.tmp_radii = torch.cat([self.tmp_radii, new_tmp_radii], dim=0)
- 
-    def duplicate_initial_points(self):
-        """
-        Duplicates all Gaussians and expands all internal states accordingly.
-        Ensures duplicated tensors remain leaf with requires_grad=True where applicable.
-        Must be called only once after initialization.
-        """
-        print(f"[INFO] Duplicating initial {self._xyz.shape[0]} points...")
-
-        def dup_leaf(x):
-            x1 = x.detach().clone().requires_grad_(x.requires_grad)
-            x2 = x.detach().clone().requires_grad_(x.requires_grad)
-            return torch.cat([x1, x2], dim=0).detach().requires_grad_(x.requires_grad)
-
-        self._xyz = dup_leaf(self._xyz)
-        self._features_dc = dup_leaf(self._features_dc)
-        self._features_rest = dup_leaf(self._features_rest)
-        self._scaling = dup_leaf(self._scaling)
-        self._rotation = dup_leaf(self._rotation)
-        self._opacity = dup_leaf(self._opacity)
-
-        # Sync optional tensors (these usually don't require grad)
-        def dup(x):
-            return torch.cat([x, x.clone()], dim=0)
-
-        if hasattr(self, "tmp_radii"):
-            self.tmp_radii = dup(self.tmp_radii)
-        if hasattr(self, "max_radii2D"):
-            self.max_radii2D = dup(self.max_radii2D)
-        if hasattr(self, "xyz_gradient_accum"):
-            self.xyz_gradient_accum = dup(self.xyz_gradient_accum)
-        if hasattr(self, "denom"):
-            self.denom = dup(self.denom)
-
-        print(f"[INFO] Total points after duplication: {self._xyz.shape[0]}")

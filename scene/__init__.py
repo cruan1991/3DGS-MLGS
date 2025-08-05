@@ -17,6 +17,8 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+import numpy as np
+
 
 class Scene:
 
@@ -75,22 +77,55 @@ class Scene:
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
 
         if self.loaded_iter:
-            self.gaussians.load_ply(os.path.join(self.model_path,
-                                                           "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"), args.train_test_exp)
+            gaussian_ball_path = os.path.join(self.model_path,
+                                         "gaussian_ball",
+                                         "iteration_" + str(self.loaded_iter),
+                                         "point_cloud.ply")
+            # Try new path first
+            if os.path.exists(gaussian_ball_path):
+                self.gaussians.load_ply(gaussian_ball_path, args.train_test_exp)
+            else:
+                # Fall back to old path for backward compatibility
+                old_path = os.path.join(self.model_path,
+                                      "point_cloud",
+                                      "iteration_" + str(self.loaded_iter),
+                                      "point_cloud.ply")
+                if os.path.exists(old_path):
+                    print("Warning: Loading from old point_cloud directory structure")
+                    self.gaussians.load_ply(old_path, args.train_test_exp)
+                else:
+                    raise FileNotFoundError(f"Could not find gaussian ball file at {gaussian_ball_path} or {old_path}")
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
-    def save(self, iteration):
-        point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
-        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+    def save(self, iteration, suffix=""):
+        """Save the scene to a file.
+        
+        Args:
+            iteration (int): The current iteration number
+            suffix (str, optional): Optional suffix to add to the filename. Defaults to "".
+        """
+        output_dir = os.path.join(self.model_path, "gaussian_ball", f"iteration_{iteration}{suffix}")
+        os.makedirs(output_dir, exist_ok=True)
+        self.gaussians.save_ply(os.path.join(output_dir, "gaussian_ball.ply"))
+
+        # Save NPZ with same name
+        npz_path = os.path.join(output_dir, "guassian_ball.npz")
+        np.savez_compressed(npz_path,
+                        xyz=self.gaussians._xyz.detach().cpu().numpy(),
+                        features_dc=self.gaussians._features_dc.detach().cpu().numpy(),
+                        features_rest=self.gaussians._features_rest.detach().cpu().numpy(),
+                        opacities=self.gaussians._opacity.detach().cpu().numpy(),
+                        scales=self.gaussians._scaling.detach().cpu().numpy(),
+                        rotations=self.gaussians._rotation.detach().cpu().numpy())
+
+        # Save exposure data with suffix
         exposure_dict = {
             image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
             for image_name in self.gaussians.exposure_mapping
         }
-
-        with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
+        exposure_file = os.path.join(self.model_path, f"exposure{suffix}.json")
+        with open(exposure_file, "w") as f:
             json.dump(exposure_dict, f, indent=2)
 
     def getTrainCameras(self, scale=1.0):
