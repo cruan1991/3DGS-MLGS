@@ -46,7 +46,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
-        antialiasing=pipe.antialiasing
+        #antialiasing=pipe.antialiasing
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -99,15 +99,28 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
     else:
-        rendered_image, radii, depth_image = rasterizer(
-            means3D = means3D,
-            means2D = means2D,
-            shs = shs,
-            colors_precomp = colors_precomp,
-            opacities = opacity,
-            scales = scales,
-            rotations = rotations,
-            cov3D_precomp = cov3D_precomp)
+        try:
+            rendered_image, radii, depth_image = rasterizer(
+                means3D = means3D,
+                means2D = means2D,
+                shs = shs,
+                colors_precomp = colors_precomp,
+                opacities = opacity,
+                scales = scales,
+                rotations = rotations,
+                cov3D_precomp = cov3D_precomp)
+        except ValueError:
+                rendered_image, radii = rasterizer(
+                means3D = means3D,
+                means2D = means2D,
+                shs = shs,
+                colors_precomp = colors_precomp,
+                opacities = opacity,
+                scales = scales,
+                rotations = rotations,
+                cov3D_precomp = cov3D_precomp)
+                depth_image = None
+
         
     # Apply exposure to rendered image (training only)
     if use_trained_exp:
