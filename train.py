@@ -8,13 +8,12 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
-# ========== 修改1: 使用你的image_utils.py中的函数，避免命名冲突 ==========
-from utils.image_utils import cal_psnr as psnr_fn, cal_ssim as ssim_fn, cal_lpips as lpips_fn
+from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import logging
 from datetime import datetime
-import csv
+import numpy as np
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -34,334 +33,145 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-# ========== 修改2: 替换原有的BestResultTracker为ComprehensiveTracker ==========
-class ComprehensiveTracker:
+# 设置双重日志输出
+class DualLogger:
+    def __init__(self, log_file):
+        self.terminal = sys.stdout
+        self.log = open(log_file, 'w', buffering=1)  # 行缓冲
+        
+    def write(self, message):
+        self.terminal.write(message)
+        self.terminal.flush()
+        # 过滤掉 tqdm 的控制字符
+        if '\r' not in message and '\033' not in message:
+            self.log.write(message)
+            self.log.flush()
+            
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+        
+    def close(self):
+        self.log.close()
+
+class BestResultTracker:
     def __init__(self, model_path):
         self.model_path = model_path
-        
-        # ========== 分别追踪每个指标的最佳值 ==========
         self.best_psnr = float('-inf')
-        self.best_ssim = float('-inf')  
-        self.best_lpips = float('inf')
         self.best_loss = float('inf')
-        
-        # 对应的最佳迭代
         self.best_psnr_iteration = -1
-        self.best_ssim_iteration = -1
-        self.best_lpips_iteration = -1
         self.best_loss_iteration = -1
+        self.last_psnr = float('-inf')
+        self.last_loss = float('inf')
         
-        # 增量改进跟踪
-        self.last_recorded_psnr = float('-inf')
-        self.last_recorded_loss = float('inf')
-        
-        # 高斯球分布统计
-        self.densify_events = []
-        self.last_gaussian_count = 0
-        
-        # 创建统一的CSV日志
-        self.main_csv_path = os.path.join(model_path, 'training_metrics.csv')
-        self.main_csv_file = open(self.main_csv_path, 'w', newline='')
-        self.csv_writer = csv.writer(self.main_csv_file)
-        
-        # ========== CSV头部（为每个指标添加best字段） ==========
-        headers = [
-            "iteration", "train_psnr", "train_ssim", "train_lpips", "train_loss",
-            "test_psnr", "test_ssim", "test_lpips", "test_loss",
-            "num_gaussians", "gaussian_change", "densify_events_since_last",
-            "avg_opacity", "opacity_std", 
-            "avg_scale_x", "avg_scale_y", "avg_scale_z",
-            "scale_std_x", "scale_std_y", "scale_std_z",
-            "position_spread_x", "position_spread_y", "position_spread_z",
-            "sh_degree", "learning_rate_xyz", "learning_rate_sh", "significant_improvement",
-            "is_best_psnr", "is_best_ssim", "is_best_lpips", "is_best_loss"
-        ]
-        self.csv_writer.writerow(headers)
-        
-        # 创建统一的日志文件
-        self.log_path = os.path.join(model_path, 'training_complete.log')
-        self.logger = logging.getLogger('comprehensive_tracker')
-        self.logger.handlers = []
-        handler = logging.FileHandler(self.log_path)
+        # Create improvements log file
+        self.improvements_log_path = os.path.join(model_path, 'improvements.log')
+        self.improvements_logger = logging.getLogger('improvements')
+        self.improvements_logger.handlers = []  # Clear any existing handlers
+        handler = logging.FileHandler(self.improvements_log_path)
         handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-        self.logger.addHandler(handler)
-        self.logger.setLevel(logging.INFO)
-        self.logger.propagate = False
+        self.improvements_logger.addHandler(handler)
+        self.improvements_logger.setLevel(logging.INFO)
+        self.improvements_logger.propagate = False  # Don't propagate to root logger
         
-        self.logger.info("=" * 100)
-        self.logger.info("COMPREHENSIVE TRAINING TRACKER INITIALIZED")
-        self.logger.info("=" * 100)
+        # Log header
+        self.improvements_logger.info("Training Improvements Log")
+        self.improvements_logger.info("-" * 120)
+        header = (
+            f"{'Iteration':>8} | {'PSNR (dB)':>10} | {'Loss':>10} | {'#Gaussians':>10} | "
+            f"{'Best PSNR':>10} | {'Best Loss':>10} | {'Best PSNR Iter':>10} | {'Best Loss Iter':>10} | "
+            f"{'Change from Last':>25} | {'Change from Best':>25}"
+        )
+        self.improvements_logger.info(header)
+        self.improvements_logger.info("-" * 120)
         
-    def record_densify_event(self, iteration, event_type, count_before, count_after):
-        """记录密化事件"""
-        event = {
-            'iteration': iteration,
-            'type': event_type,
-            'count_before': count_before,
-            'count_after': count_after,
-            'change': count_after - count_before
-        }
-        self.densify_events.append(event)
-        
-    def compute_gaussian_statistics(self, gaussians):
-        """计算高斯球的详细统计信息"""
-        with torch.no_grad():
-            positions = gaussians.get_xyz
-            scales = gaussians.get_scaling
-            opacities = gaussians.get_opacity
-            
-            stats = {
-                'num_gaussians': positions.shape[0],
-                'avg_opacity': float(opacities.mean()),
-                'opacity_std': float(opacities.std()),
-                'avg_scale': scales.mean(dim=0).tolist(),
-                'scale_std': scales.std(dim=0).tolist(),
-                'position_spread': (positions.max(dim=0)[0] - positions.min(dim=0)[0]).tolist()
-            }
-            return stats
-    
-    def update(self, iteration, train_metrics, test_metrics=None, gaussians=None, learning_rates=None):
-        """更新所有指标"""
-        
-        # 计算高斯球统计
-        gauss_stats = self.compute_gaussian_statistics(gaussians) if gaussians else {}
-        gaussian_change = gauss_stats.get('num_gaussians', 0) - self.last_gaussian_count
-        
-        # 计算自上次记录以来的密化事件
-        recent_densify_events = len([e for e in self.densify_events if e['iteration'] > iteration - 200])
-        
-        # ========== 增量改进检测，调整阈值 ==========
-        psnr_change = train_metrics.get('psnr', 0) - self.last_recorded_psnr if self.last_recorded_psnr != float('-inf') else 0
-        loss_change = self.last_recorded_loss - train_metrics.get('loss', 0) if self.last_recorded_loss != float('inf') else 0
-        
-        # 调整阈值：PSNR改进0.5dB以上，或loss改进0.01以上才记录
-        significant_improvement = (psnr_change > 0.5 or loss_change > 0.01)
-        
-        # ========== 分别检查每个指标的最佳值 ==========
+    def update(self, iteration, psnr, loss, num_gaussians=None):
+        """Returns tuple (is_best_psnr, is_best_loss)"""
         is_best_psnr = False
-        is_best_ssim = False  
-        is_best_lpips = False
         is_best_loss = False
+        should_log = False
         
-        # 检查训练PSNR和Loss（基于训练数据）
-        current_train_psnr = train_metrics.get('psnr', 0)
-        current_train_loss = train_metrics.get('loss', float('inf'))
+        # Calculate changes from last iteration
+        psnr_change = psnr - self.last_psnr if self.last_psnr != float('-inf') else 0
+        loss_change = self.last_loss - loss if self.last_loss != float('inf') else 0
         
-        if current_train_psnr > self.best_psnr:
-            self.best_psnr = current_train_psnr
+        # Calculate changes from best
+        psnr_vs_best = psnr - self.best_psnr if self.best_psnr != float('-inf') else 0
+        loss_vs_best = self.best_loss - loss if self.best_loss != float('inf') else 0
+        
+        # Check if this is a new best PSNR
+        if psnr > self.best_psnr:
+            self.best_psnr = psnr
             self.best_psnr_iteration = iteration
             is_best_psnr = True
+            should_log = True
             
-        if current_train_loss < self.best_loss:
-            self.best_loss = current_train_loss
+        # Check if this is a new best loss
+        if loss < self.best_loss:
+            self.best_loss = loss
             self.best_loss_iteration = iteration
             is_best_loss = True
+            should_log = True
         
-        # 检查测试SSIM和LPIPS（基于测试数据，如果有的话）
-        if test_metrics:
-            current_test_ssim = test_metrics.get('ssim', 0)
-            current_test_lpips = test_metrics.get('lpips', float('inf'))
+        # Also log if there's significant improvement from last iteration
+        if psnr_change > 0.01 or loss_change > 0.001:  # Thresholds for logging
+            should_log = True
             
-            if current_test_ssim > self.best_ssim:
-                self.best_ssim = current_test_ssim
-                self.best_ssim_iteration = iteration
-                is_best_ssim = True
-                
-            if current_test_lpips < self.best_lpips:
-                self.best_lpips = current_test_lpips
-                self.best_lpips_iteration = iteration
-                is_best_lpips = True
-        
-        # ========== 写入CSV，包含所有best标志 ==========
-        row = [
-            iteration,
-            train_metrics.get('psnr', ''), train_metrics.get('ssim', ''), 
-            train_metrics.get('lpips', ''), train_metrics.get('loss', ''),
-            test_metrics.get('psnr', '') if test_metrics else '',
-            test_metrics.get('ssim', '') if test_metrics else '',
-            test_metrics.get('lpips', '') if test_metrics else '',
-            test_metrics.get('loss', '') if test_metrics else '',
-            gauss_stats.get('num_gaussians', ''),
-            gaussian_change,
-            recent_densify_events,
-            gauss_stats.get('avg_opacity', ''),
-            gauss_stats.get('opacity_std', ''),
-            *gauss_stats.get('avg_scale', ['', '', '']),
-            *gauss_stats.get('scale_std', ['', '', '']),
-            *gauss_stats.get('position_spread', ['', '', '']),
-            gaussians.active_sh_degree if gaussians else '',
-            learning_rates.get('xyz', '') if learning_rates else '',
-            learning_rates.get('sh', '') if learning_rates else '',
-            int(significant_improvement),
-            int(is_best_psnr),
-            int(is_best_ssim),
-            int(is_best_lpips),
-            int(is_best_loss)
-        ]
-        self.csv_writer.writerow(row)
-        self.main_csv_file.flush()
-        
-        # ========== 决定是否记录日志（任何best或重要事件） ==========
-        should_log = (
-            iteration % 1000 == 0 or 
-            is_best_psnr or
-            is_best_ssim or
-            is_best_lpips or 
-            is_best_loss or
-            recent_densify_events > 0 or 
-            significant_improvement
-        )
-        
+        # Log if we should
         if should_log:
-            self.log_comprehensive_update(iteration, train_metrics, test_metrics, gauss_stats, 
-                                        recent_densify_events, significant_improvement, psnr_change, loss_change,
-                                        is_best_psnr, is_best_ssim, is_best_lpips, is_best_loss)
+            msg = (
+                f"{iteration:8d} | {psnr:10.4f} | {loss:10.6f} | {num_gaussians:10d} | "
+                f"{self.best_psnr:10.4f} | {self.best_loss:10.6f} | {self.best_psnr_iteration:10d} | {self.best_loss_iteration:10d} | "
+                f"PSNR: {psnr_change:+7.4f}, Loss: {loss_change:+7.6f} | "
+                f"PSNR: {psnr_vs_best:+7.4f}, Loss: {loss_vs_best:+7.6f}"
+            )
             
-            # 更新上次记录的值
-            self.last_recorded_psnr = train_metrics.get('psnr', self.last_recorded_psnr)
-            self.last_recorded_loss = train_metrics.get('loss', self.last_recorded_loss)
+            # Add indicators for best values
+            if is_best_psnr:
+                msg += " | 🏆 Best PSNR"
+            if is_best_loss:
+                msg += " | 🏆 Best Loss"
+                
+            self.improvements_logger.info(msg)
         
-        # 更新状态
-        self.last_gaussian_count = gauss_stats.get('num_gaussians', 0)
-        
-        return is_best_psnr, is_best_ssim, is_best_lpips, is_best_loss  # 返回四个标志
-    
-    def log_comprehensive_update(self, iteration, train_metrics, test_metrics, gauss_stats, 
-                               recent_densify_events, significant_improvement=False, psnr_change=0, loss_change=0,
-                               is_best_psnr=False, is_best_ssim=False, is_best_lpips=False, is_best_loss=False):
-        """记录综合更新信息"""
-        
-        msg = f"\n{'='*80}\n"
-        msg += f"ITERATION {iteration:,}"
-        
-        # 添加所有的最佳标志
-        best_flags = []
-        if significant_improvement:
-            best_flags.append("📈 SIGNIFICANT IMPROVEMENT")
-        if is_best_psnr:
-            best_flags.append("🏆 BEST PSNR")
-        if is_best_ssim:
-            best_flags.append("🏆 BEST SSIM")
-        if is_best_lpips:
-            best_flags.append("🏆 BEST LPIPS")
-        if is_best_loss:
-            best_flags.append("🏆 BEST LOSS")
+        # Update last values
+        self.last_psnr = psnr
+        self.last_loss = loss
             
-        if best_flags:
-            msg += f" {' '.join(best_flags)}"
-        msg += f"\n{'='*80}\n"
+        return is_best_psnr, is_best_loss
         
-        # 训练指标
-        msg += f"🔵 TRAINING METRICS:\n"
-        msg += f"  PSNR: {train_metrics.get('psnr', 'N/A'):>8.3f} dB"
-        if significant_improvement and psnr_change > 0:
-            msg += f" (↑{psnr_change:+.3f})"
-        if is_best_psnr:
-            msg += f" 🏆"
-        msg += f"\n"
+    def save_checkpoint(self, iteration, state, logger=None, is_final=False):
+        """Save checkpoint based on type (best_psnr, best_loss, or final)"""
+        if is_final:
+            checkpoint_path = os.path.join(self.checkpoint_dir, f"final_state.pth")
+            # if logger:
+            #     logger.info(f"Saving final state checkpoint to: {checkpoint_path}")
+        elif iteration == self.best_psnr_iteration:
+            checkpoint_path = os.path.join(self.checkpoint_dir, "best_psnr.pth")
+            # if logger:
+                # logger.info(f"Saving best PSNR checkpoint to: {checkpoint_path}")
+        elif iteration == self.best_loss_iteration:
+            checkpoint_path = os.path.join(self.checkpoint_dir, "best_loss.pth")
+            # if logger:
+                # logger.info(f"Saving best loss checkpoint to: {checkpoint_path}")
+        else:
+            # Regular checkpoint requested by user
+            checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_{iteration}.pth")
+            # if logger:
+                # logger.info(f"Saving user-requested checkpoint to: {checkpoint_path}")
         
-        msg += f"  SSIM: {train_metrics.get('ssim', 'N/A'):>8.4f}"
-        if is_best_ssim and test_metrics:  # SSIM best基于测试数据
-            msg += f" 🏆"
-        msg += f"\n"
-        
-        msg += f"  LPIPS: {train_metrics.get('lpips', 'N/A'):>7.4f}"
-        if is_best_lpips and test_metrics:  # LPIPS best基于测试数据
-            msg += f" 🏆"
-        msg += f"\n"
-        
-        msg += f"  Loss: {train_metrics.get('loss', 'N/A'):>8.6f}"
-        if significant_improvement and loss_change > 0:
-            msg += f" (↓{loss_change:+.6f})"
-        if is_best_loss:
-            msg += f" 🏆"
-        msg += f"\n"
-        
-        # ========== 显示所有历史最佳值 ==========
-        msg += f"\n📈 HISTORICAL BEST VALUES:\n"
-        msg += f"  Best PSNR: {self.best_psnr:.4f} dB (iter {self.best_psnr_iteration})\n"
-        msg += f"  Best SSIM: {self.best_ssim:.4f} (iter {self.best_ssim_iteration})\n"
-        msg += f"  Best LPIPS: {self.best_lpips:.4f} (iter {self.best_lpips_iteration})\n"
-        msg += f"  Best Loss: {self.best_loss:.6f} (iter {self.best_loss_iteration})\n"
-        
-        # 当前测试指标（如果有）
-        if test_metrics:
-            msg += f"\n📊 CURRENT TEST METRICS:\n"
-            msg += f"  PSNR: {test_metrics['psnr']:>8.3f} dB\n"
-            msg += f"  SSIM: {test_metrics['ssim']:>8.4f}\n"
-            msg += f"  LPIPS: {test_metrics['lpips']:>7.4f}\n"
-            msg += f"  Loss: {test_metrics['loss']:>7.6f}\n"
-        
-        # 高斯球统计
-        msg += f"\n🟡 GAUSSIAN STATISTICS:\n"
-        msg += f"  Count: {gauss_stats.get('num_gaussians', 0):>10,} (Δ: {gauss_stats.get('num_gaussians', 0) - self.last_gaussian_count:+,})\n"
-        msg += f"  Opacity: μ={gauss_stats.get('avg_opacity', 0):.4f}, σ={gauss_stats.get('opacity_std', 0):.4f}\n"
-        if 'avg_scale' in gauss_stats:
-            scales = gauss_stats['avg_scale']
-            msg += f"  Scale: x={scales[0]:.4f}, y={scales[1]:.4f}, z={scales[2]:.4f}\n"
-        
-        # 密化事件
-        if recent_densify_events > 0:
-            msg += f"\n🔄 DENSIFICATION:\n"
-            msg += f"  Recent events: {recent_densify_events}\n"
-            recent_events = [e for e in self.densify_events if e['iteration'] > iteration - 200][-3:]
-            for event in recent_events:
-                msg += f"    {event['type']} @ iter {event['iteration']}: {event['count_before']:,} → {event['count_after']:,}\n"
-            
-        msg += f"{'='*80}\n"
-        
-        self.logger.info(msg)
-    
-    def close(self):
-        """关闭所有文件句柄"""
-        self.main_csv_file.close()
-        for handler in self.logger.handlers:
-            handler.close()
-        self.logger.handlers.clear()
-
-# ========== 修改3: 定义compute_metrics函数 ==========
-def compute_metrics(img1, img2):
-    """使用image_utils中的函数计算所有指标"""
-    return {
-        'psnr': psnr_fn(img1, img2).mean().item(),
-        'ssim': ssim_fn(img1, img2).mean().item(),
-        'lpips': lpips_fn(img1, img2).mean().item()
-    }
-
-# ========== 修改4: 增强的测试评估函数 ==========
-def run_comprehensive_test(scene, renderFunc, renderArgs, train_test_exp):
-    """运行全面的测试评估"""
-    test_cameras = scene.getTestCameras()
-    if not test_cameras:
-        return None
-        
-    all_metrics = {'psnr': [], 'ssim': [], 'lpips': [], 'loss': []}
-    
-    for viewpoint in test_cameras:
-        image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-        gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-        
-        if train_test_exp:
-            image = image[..., image.shape[-1] // 2:]
-            gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-        
-        metrics = compute_metrics(image, gt_image)
-        metrics['loss'] = l1_loss(image, gt_image).mean().item()
-        
-        for key, value in metrics.items():
-            all_metrics[key].append(value)
-    
-    # 计算平均值
-    avg_metrics = {key: sum(values) / len(values) for key, values in all_metrics.items()}
-    return avg_metrics
+        torch.save(state, checkpoint_path)
 
 def setup_logging(model_path):
     """设置日志系统"""
+    # 确保模型目录存在
     os.makedirs(model_path, exist_ok=True)
     
+    # 主训练日志
     log_filename = f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_file = os.path.join(model_path, log_filename)
     
+    # 设置logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -371,7 +181,11 @@ def setup_logging(model_path):
         ]
     )
     
+    # 打印日志文件位置
     print(f"Training log: {log_file}")
+    print(f"Improvements log: {os.path.join(model_path, 'improvements.log')}")
+    
+    # 返回logger
     return logging.getLogger(__name__)
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -385,9 +199,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     
-    # ========== 修改5: 使用新的ComprehensiveTracker ==========
+    # Initialize loggers and best result tracker
     logger = setup_logging(scene.model_path)
-    tracker = ComprehensiveTracker(scene.model_path)
+    best_tracker = BestResultTracker(scene.model_path)
     logger.info(f"Starting training with model path: {scene.model_path}")
     logger.info(f"Dataset source path: {dataset.source_path if hasattr(dataset, 'source_path') else 'Unknown'}")
     logger.info(f"Optimization settings: iterations={opt.iterations}, densify_from_iter={opt.densify_from_iter}, densify_until_iter={opt.densify_until_iter}")
@@ -403,7 +217,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     # Save initial gaussian state
     logger.info("Saving initial gaussian state...")
-    scene.save(0, "_initial")
+    scene.save(0, "_initial")  # Save to iteration_0 folder
     logger.info(f"Initial gaussians saved to: {os.path.join(scene.model_path, 'gaussian_ball/iteration_0_initial')}")
     
     gaussians.training_setup(opt)
@@ -426,8 +240,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    # 使用 leave=True 确保进度条在完成后保留
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", file=sys.stdout, leave=True)
     first_iter += 1
+    
+    # Variables to store evaluation results
+    last_test_psnr = 0.0
+    last_test_loss = 0.0
     
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -449,6 +268,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.update_learning_rate(iteration)
 
+        # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
@@ -502,68 +322,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
-            progress_bar.update(1)
-
-            if iteration % 200 == 0:
+            if iteration % 100 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                progress_bar.update(100)
                 
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # ========== 修改6: 计算完整的训练指标 ==========
-            train_metrics = compute_metrics(image, gt_image)
-            train_metrics['loss'] = loss.item()
-
-            # ========== 修改7: 在测试迭代中计算完整测试指标 ==========
-            test_metrics = None
-            if iteration in testing_iterations:
-                test_metrics = run_comprehensive_test(scene, render, 
-                                                    (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), 
-                                                    dataset.train_test_exp)
-
-            # 获取学习率信息
-            learning_rates = {
-                'xyz': gaussians.optimizer.param_groups[0]['lr'],
-                'sh': gaussians.optimizer.param_groups[1]['lr'] if len(gaussians.optimizer.param_groups) > 1 else 0
-            }
-
-            # ========== 修改8: 使用新的tracker更新，处理四个返回值 ==========
-            is_best_psnr, is_best_ssim, is_best_lpips, is_best_loss = tracker.update(iteration, train_metrics, test_metrics, gaussians, learning_rates)
-
-            # Log training metrics to TensorBoard
-            tb_writer.add_scalar("train/psnr", train_metrics['psnr'], iteration)
-            tb_writer.add_scalar("train/ssim", train_metrics['ssim'], iteration)
-            tb_writer.add_scalar("train/lpips", train_metrics['lpips'], iteration)
-            tb_writer.add_scalar("train/loss", train_metrics['loss'], iteration)
-            tb_writer.add_scalar("train/num_gaussians", gaussians.get_xyz.shape[0], iteration)
-
-            # ========== 为每个最佳指标分别保存检查点 ==========
-            if is_best_psnr:
-                scene.save(iteration, "_best_psnr")
-            if is_best_ssim:
-                scene.save(iteration, "_best_ssim")
-            if is_best_lpips:
-                scene.save(iteration, "_best_lpips")
-            if is_best_loss:
-                scene.save(iteration, "_best_loss")
-
-            # Regular checkpoint saving
-            if iteration in checkpoint_iterations:
-                scene.save(iteration)
-                
-            # Save final state
-            if iteration == opt.iterations:
-                scene.save(iteration, "_final")
-                logger.info(f"Final state saved to: {os.path.join(scene.model_path, f'gaussian_ball/iteration_{iteration}_final')}")
-                tracker.close()
-
-            # ========== 修改9: 增强的training_report ==========
-            enhanced_training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), 
-                                   testing_iterations, scene, render, 
-                                   (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), 
-                                   dataset.train_test_exp, logger, tracker, test_metrics)
+            # Calculate current metrics for improvement tracking
+            current_psnr = psnr(image, gt_image).mean().double()
+            current_loss = loss.item()
+            num_gaussians = gaussians.get_xyz.shape[0]
             
-            # ========== 新增: 主训练日志每1000次迭代固定输出 ==========
+            # Update best tracker with current results
+            if best_tracker is not None:
+                is_best_psnr, is_best_loss = best_tracker.update(iteration, float(current_psnr), float(current_loss), num_gaussians)
+                # 3000次迭代后保存改进的高斯球
+                if iteration >= 3000:
+                    if is_best_psnr:
+                        scene.save(iteration, "_best_psnr")
+                    if is_best_loss:
+                        scene.save(iteration, "_best_loss")
+
+            # Log and save
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), 
+                          testing_iterations, scene, render, 
+                          (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), 
+                          dataset.train_test_exp, logger, best_tracker)
+            
+            # 按照命令行参数保存
+            if iteration in saving_iterations:
+                save_msg = f"[ITER {iteration}] Saving Gaussians"
+                print(f"\n{save_msg}")
+                if logger:
+                    logger.info(save_msg)
+                scene.save(iteration)
+
+            # 每1000次迭代输出统计信息
             if iteration % 1000 == 0:
                 with torch.no_grad():
                     positions = gaussians._xyz.detach().cpu()
@@ -571,66 +366,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     xyz_min = positions.min(dim=0).values
                     xyz_max = positions.max(dim=0).values
                     xyz_range = xyz_max - xyz_min
-
-                    # 主训练日志的规律输出
-                    stats_info = f"\n{'='*80}\n"
-                    stats_info += f"[TRAINING PROGRESS] Iteration {iteration:,}\n"
-                    stats_info += f"{'='*80}\n"
-                    stats_info += f"📊 Current Metrics:\n"
-                    stats_info += f"  ➤ Train PSNR: {train_metrics['psnr']:.4f} dB\n"  
-                    stats_info += f"  ➤ Train SSIM: {train_metrics['ssim']:.4f}\n"
-                    stats_info += f"  ➤ Train LPIPS: {train_metrics['lpips']:.4f}\n"
-                    stats_info += f"  ➤ Train Loss: {ema_loss_for_log:.7f}\n"
-                    stats_info += f"  ➤ Depth Loss: {ema_Ll1depth_for_log:.7f}\n"
                     
-                    if test_metrics:  # 如果有测试结果
-                        stats_info += f"\n📈 Test Metrics:\n"
-                        stats_info += f"  ➤ Test PSNR: {test_metrics['psnr']:.4f} dB\n"
-                        stats_info += f"  ➤ Test SSIM: {test_metrics['ssim']:.4f}\n"
-                        stats_info += f"  ➤ Test LPIPS: {test_metrics['lpips']:.4f}\n"
-                        stats_info += f"  ➤ Test Loss: {test_metrics['loss']:.6f}\n"
-                        
+                    # 输出高斯球的统计信息
+                    stats_info = f"\n{'='*60}\n"
+                    stats_info += f"[STATISTICS] Iteration {iteration}\n"
+                    stats_info += f"{'='*60}\n"
+                    stats_info += f"📊 Training Metrics:\n"
+                    stats_info += f"  ➤ Training Loss: {ema_loss_for_log:.7f}\n"
+                    stats_info += f"  ➤ Depth Loss: {ema_Ll1depth_for_log:.7f}\n"
                     stats_info += f"\n🔵 Gaussian Statistics:\n"
-                    stats_info += f"  ➤ Count: {num_points:,}\n"
+                    stats_info += f"  ➤ Number of Gaussians: {num_points:,}\n"
                     stats_info += f"  ➤ Position Range:\n"
                     stats_info += f"     x: [{xyz_min[0]:.3f}, {xyz_max[0]:.3f}] (range: {xyz_range[0]:.3f})\n"
                     stats_info += f"     y: [{xyz_min[1]:.3f}, {xyz_max[1]:.3f}] (range: {xyz_range[1]:.3f})\n"
                     stats_info += f"     z: [{xyz_min[2]:.3f}, {xyz_max[2]:.3f}] (range: {xyz_range[2]:.3f})\n"
+                    stats_info += f"{'='*60}\n"
                     
-                    stats_info += f"\n📈 Historical Best:\n"
-                    stats_info += f"  ➤ Best PSNR: {tracker.best_psnr:.4f} dB (iter {tracker.best_psnr_iteration})\n"
-                    stats_info += f"  ➤ Best SSIM: {tracker.best_ssim:.4f} (iter {tracker.best_ssim_iteration})\n"
-                    stats_info += f"  ➤ Best LPIPS: {tracker.best_lpips:.4f} (iter {tracker.best_lpips_iteration})\n"
-                    stats_info += f"  ➤ Best Loss: {tracker.best_loss:.6f} (iter {tracker.best_loss_iteration})\n"
-                    
-                    stats_info += f"{'='*80}\n"
-                    
-                    # 同时输出到控制台和主训练日志
                     print(stats_info)
-                    logger.info(stats_info)
-                
-            if (iteration in saving_iterations):
-                save_msg = f"[ITER {iteration}] Saving Gaussians"
-                print(f"{save_msg}")
-                logger.info(save_msg)
-                scene.save(iteration)
+                    if logger:
+                        logger.info(stats_info)
 
-            # ========== 修改10: 密化时记录事件 ==========
+            # Densification
             if iteration < opt.densify_until_iter:
+                # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    
-                    # 记录密化前后的高斯数量
-                    count_before = gaussians.get_xyz.shape[0]
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                    count_after = gaussians.get_xyz.shape[0]
-                    
-                    # 记录密化事件
-                    if count_after != count_before:
-                        tracker.record_densify_event(iteration, 'densify_prune', count_before, count_after)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -652,13 +416,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print(f"{checkpoint_msg}")
                 logger.info(checkpoint_msg)
                 
+                # 保存到 model_path/checkpoint/ 目录
                 checkpoint_dir = os.path.join(scene.model_path, "checkpoint")
                 os.makedirs(checkpoint_dir, exist_ok=True)
                 
                 checkpoint_path = os.path.join(checkpoint_dir, f"chkpnt{iteration}.pth")
                 torch.save((gaussians.capture(), iteration), checkpoint_path)
                 logger.info(f"Checkpoint saved to: {checkpoint_path}")
-
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -668,11 +432,13 @@ def prepare_output_and_logger(args):
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
+    # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
+    # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
@@ -680,8 +446,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def enhanced_training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene, renderFunc, renderArgs, train_test_exp, logger=None, tracker=None, test_metrics=None):
-    """增强版的training_report，支持完整指标"""
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, logger=None, best_tracker=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -690,47 +455,68 @@ def enhanced_training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, 
     # Full evaluation on test iterations
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = (
-            {'name': 'test', 'cameras': scene.getTestCameras()}, 
-            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]}
-        )
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+                            {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
+        test_results = None
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
-                all_metrics = {'psnr': [], 'ssim': [], 'lpips': [], 'loss': []}
-                
+                l1_test = 0.0
+                psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
-                    
-                    # 计算完整指标
-                    metrics = compute_metrics(image, gt_image)
-                    metrics['loss'] = l1_loss(image, gt_image).mean().double().item()
-                    
-                    for key, value in metrics.items():
-                        all_metrics[key].append(value)
-                    
                     if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                        # Convert tensor to numpy array in correct format for tensorboard
+                        def prepare_image(img_tensor):
+                            # Move to CPU and convert to numpy
+                            img_np = img_tensor.detach().cpu().numpy()
+                            # Convert from CHW to HWC if needed
+                            if img_np.shape[0] in [1, 3, 4]:
+                                img_np = np.transpose(img_np, (1, 2, 0))
+                            # Scale to 0-255
+                            img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
+                            # Ensure 3 channels
+                            if len(img_np.shape) == 2:
+                                img_np = np.stack([img_np] * 3, axis=-1)
+                            elif img_np.shape[-1] == 1:
+                                img_np = np.concatenate([img_np] * 3, axis=-1)
+                            # Convert back to CHW format for tensorboard
+                            img_np = np.transpose(img_np, (2, 0, 1))
+                            return img_np
 
-                # 计算平均指标
-                avg_metrics = {key: sum(values) / len(values) for key, values in all_metrics.items()}
+                        # Add images to tensorboard directly as numpy arrays
+                        render_np = prepare_image(image)
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name),
+                                          render_np[None], global_step=iteration, dataformats='NCHW')
+                        
+                        if iteration == testing_iterations[0]:
+                            gt_np = prepare_image(gt_image)
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
+                                              gt_np[None], global_step=iteration, dataformats='NCHW')
+                            
+                    l1_test += l1_loss(image, gt_image).mean().double()
+                    psnr_test += psnr(image, gt_image).mean().double()
+                psnr_test /= len(config['cameras'])
+                l1_test /= len(config['cameras'])
+
+                if config['name'] == 'test':
+                    test_results = {'psnr': float(psnr_test), 'loss': float(l1_test)}
                 
                 if tb_writer:
-                    for metric_name, metric_value in avg_metrics.items():
-                        tb_writer.add_scalar(f"{config['name']}/loss_viewpoint - {metric_name}", metric_value, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
+                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        
         torch.cuda.empty_cache()
+
+        return test_results
+    return None
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -752,13 +538,16 @@ if __name__ == "__main__":
     
     # 自动生成 test_iterations 和 save_iterations
     if args.test_iterations is None:
+        # 早期的几个关键点 + 从10000开始每5000次迭代
         early_iterations = [1_000, 3_000, 5_000, 7_000]
         auto_iterations = list(range(10_000, args.iterations + 1, 5_000))
         args.test_iterations = early_iterations + auto_iterations
         
     if args.save_iterations is None:
+        # 与 test_iterations 保持一致
         args.save_iterations = args.test_iterations.copy()
     
+    # 确保最终迭代数也被包含
     if args.iterations not in args.save_iterations:
         args.save_iterations.append(args.iterations)
     

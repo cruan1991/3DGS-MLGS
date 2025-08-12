@@ -337,7 +337,10 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self._xyz.shape[0]), device="cuda")
         self.tmp_radii = torch.zeros((self._xyz.shape[0]), device="cuda")  # ✅ 补上这行
 
-        self.pretrained_exposures = None
+        # 🔥 修复：不要无条件重置pretrained_exposures！
+        # 只有在没有使用train_test_exp时才设置为None
+        if not use_train_test_exp:
+            self.pretrained_exposures = None
 
 
     def replace_tensor_to_optimizer(self, tensor, name):

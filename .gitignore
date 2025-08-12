@@ -1,8 +1,63 @@
+# 数据文件
+data/
+models/
+my_gs_model/
+
+# 输出文件
+output/
+*.ply
+*.pth
+
+# 渲染结果
+*renders/
+*_renders/
+verification_output/
+correct_camera_renders/
+direct_renders/
+simple_renders/
+train_style_renders/
+
+# 分析输出
+gaussian_analysis_output*/
+pointcloud_analysis_output/
+preprocessed_stats/
+evaluation_*/
+
+# 图片和可视化
+*.png
+*.jpg
+*.jpeg
+*.html
+*.json
+
+# Python临时文件
+__pycache__/
 *.pyc
-.vscode
-output
-build
-diff_rasterization/diff_rast.egg-info
-diff_rasterization/dist
-tensorboard_3d
-screenshots
+*.pyo
+*.pyd
+.Python
+env/
+.env
+.venv
+venv/
+
+# IDE文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 大文件和模型
+*.bin
+*.pkl
+*.h5
+
+# 日志文件
+*.log
+
+# Submodules相关
+submodules/*/
