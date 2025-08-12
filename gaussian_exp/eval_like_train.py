@@ -155,3 +155,11 @@ def main():
 
 if __name__ == '__main__':
     main()
+    parser.add_argument('--model-path', required=True, help='Path to the model directory')
+    parser.add_argument('--ply-path', required=True, help='Path to the gaussian ball PLY file')
+    args = parser.parse_args()
+    
+    evaluate_like_train(args.model_path, args.ply_path)
+
+if __name__ == '__main__':
+    main()
