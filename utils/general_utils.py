@@ -19,12 +19,14 @@ def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
 def PILtoTorch(pil_image, resolution):
+    if isinstance(pil_image, torch.Tensor):
+        return pil_image  # If it's already a tensor, return it as is
     resized_image_PIL = pil_image.resize(resolution)
     resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
     if len(resized_image.shape) == 3:
         return resized_image.permute(2, 0, 1)
     else:
-        return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+        return resized_image.unsqueeze(0)
 
 def get_expon_lr_func(
     lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000

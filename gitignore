@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pt
+*.pth
+*.log
+.env
+.vscode/
+build/
+outputs/
+colmap/
+ceres-solver/
+my_3dgs/.git/

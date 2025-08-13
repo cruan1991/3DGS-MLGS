@@ -17,8 +17,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
-import numpy as np
-
+import torch
 
 class Scene:
 
@@ -107,18 +106,24 @@ class Scene:
         """
         output_dir = os.path.join(self.model_path, "gaussian_ball", f"iteration_{iteration}{suffix}")
         os.makedirs(output_dir, exist_ok=True)
-        self.gaussians.save_ply(os.path.join(output_dir, "gaussian_ball.ply"))
-
-        # Save NPZ with same name
-        npz_path = os.path.join(output_dir, "guassian_ball.npz")
-        np.savez_compressed(npz_path,
-                        xyz=self.gaussians._xyz.detach().cpu().numpy(),
-                        features_dc=self.gaussians._features_dc.detach().cpu().numpy(),
-                        features_rest=self.gaussians._features_rest.detach().cpu().numpy(),
-                        opacities=self.gaussians._opacity.detach().cpu().numpy(),
-                        scales=self.gaussians._scaling.detach().cpu().numpy(),
-                        rotations=self.gaussians._rotation.detach().cpu().numpy())
-
+        
+        # Save PLY format for visualization
+        self.gaussians.save_ply(os.path.join(output_dir, "point_cloud.ply"))
+        
+        # Save NPZ format for training recovery
+        import numpy as np
+        with torch.no_grad():
+            np.savez(
+                os.path.join(output_dir, "point_cloud.npz"),
+                xyz=self.gaussians.get_xyz.detach().cpu().numpy(),
+                features_dc=self.gaussians._features_dc.detach().cpu().numpy(),
+                features_rest=self.gaussians._features_rest.detach().cpu().numpy(),
+                opacity=self.gaussians.get_opacity.detach().cpu().numpy(),
+                rotation=self.gaussians.get_rotation.detach().cpu().numpy(),
+                scaling=self.gaussians.get_scaling.detach().cpu().numpy(),
+                max_radii2D=self.gaussians.max_radii2D.detach().cpu().numpy()
+            )
+        
         # Save exposure data with suffix
         exposure_dict = {
             image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
